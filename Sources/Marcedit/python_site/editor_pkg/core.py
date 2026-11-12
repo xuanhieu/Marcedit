@@ -6,6 +6,7 @@ Uses PyMuPDF (fitz) for text replacement with font preservation.
 """
 import fitz  # PyMuPDF
 import os
+import re
 import atexit
 import gc
 import threading
@@ -50,6 +51,130 @@ def _get_cached_font(font_path: str) -> object | None:
                 _font_object_cache.pop(next(iter(_font_object_cache)))
             _font_object_cache[font_path] = font
         return _font_object_cache[font_path]
+
+
+def _unique_r_name(page) -> str:
+    """A page font resource name no earlier edit has used.
+
+    insert_font(fontname=X) on a page that already has X returns the *old* font,
+    so a second edit encoded with new glyph IDs rendered as garbage. Fork fix."""
+    used = set()
+    try:
+        used = {f[4] for f in page.get_fonts(full=True)}
+    except Exception:
+        pass
+    n = 0
+    while f"R{n}" in used:
+        n += 1
+    return f"R{n}"
+
+
+def _font_embedded_on_page(page, fontname: str) -> bool:
+    """True if a font on *page* with a similar family name is embedded (not a
+    bare reference to one of the 14 standard fonts)."""
+    def norm(s):
+        return re.sub(r"[^a-z0-9]", "", (s or "").split("+")[-1].lower())
+    want = norm(fontname)
+    if not want:
+        return False
+    try:
+        for f in page.get_fonts():
+            has_file = f[1] not in ("n/a", "")
+            have = norm(f[3])
+            n = min(len(want), len(have), 5)
+            if has_file and n >= 4 and want[:n] == have[:n]:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# ── Metadata-preserving save ──────────────────────────────────────────────────
+
+def _save_keep_identity(doc, output_path: str, src_path=None, **save_kwargs) -> None:
+    """Save *doc* without leaving any trace of the edit in the file's identity.
+
+    * When *doc* was opened from *output_path* itself the save is INCREMENTAL
+      (appends only the changed objects), so the cost is independent of file size.
+      Otherwise it is a normal full save.
+    * MuPDF regenerates the trailer /ID on save; the original /ID array is put
+      back by patching the file tail (cheap), then verified.
+    * /Info and XMP are not touched by MuPDF; filesystem timestamps are copied
+      from *src_path* when given.
+    Metadata is only ever changed explicitly by the user (scrub / editor).
+    """
+    def _id_text(d):
+        kind, val = d.xref_get_key(-1, "ID")
+        return val if kind == "array" else ""
+
+    def _id_span(data: bytes):
+        """(start, end) of the '[...]' after the LAST '/ID' in *data*."""
+        i = data.rfind(b"/ID")
+        if i < 0:
+            return None
+        j = i + 3
+        while j < len(data) and data[j] in b" \t\r\n":
+            j += 1
+        if j >= len(data) or data[j:j + 1] != b"[":
+            return None
+        start, k = j, j + 1
+        while k < len(data):
+            c = data[k:k + 1]
+            if c == b"]":
+                return start, k + 1
+            if c == b"<":
+                k = data.index(b">", k) + 1
+            elif c == b"(":
+                depth = 1
+                k += 1
+                while depth and k < len(data):
+                    ch = data[k:k + 1]
+                    if ch == b"\\":
+                        k += 1
+                    elif ch == b"(":
+                        depth += 1
+                    elif ch == b")":
+                        depth -= 1
+                    k += 1
+            else:
+                k += 1
+        return None
+
+    orig = _id_text(doc)
+    in_place = bool(getattr(doc, "name", None)) and os.path.abspath(doc.name) == os.path.abspath(output_path)
+    if in_place and doc.can_save_incrementally():
+        doc.save(output_path, incremental=True, encryption=fitz.PDF_ENCRYPT_KEEP)
+    elif in_place:
+        tmp = output_path + ".full"
+        doc.save(tmp, **save_kwargs)
+        os.replace(tmp, output_path)
+    else:
+        doc.save(output_path, **save_kwargs)
+    try:
+        if orig:
+            with fitz.open(output_path) as out:
+                same = _id_text(out) == orig
+            if not same:
+                size = os.path.getsize(output_path)
+                tail_len = min(size, 256 * 1024)
+                with open(output_path, "r+b") as fh:
+                    fh.seek(size - tail_len)
+                    tail = fh.read()
+                    span = _id_span(tail)
+                    if span:
+                        patched = tail[:span[0]] + orig.encode("latin-1", "replace") + tail[span[1]:]
+                        fh.seek(size - tail_len)
+                        fh.write(patched)
+                        fh.truncate()
+                with fitz.open(output_path) as chk:
+                    if _id_text(chk) != orig:
+                        raise ValueError("ID restore did not verify")
+        if src_path and os.path.exists(src_path):
+            st = os.stat(src_path)
+            os.utime(output_path, ns=(st.st_atime_ns, st.st_mtime_ns))
+    except Exception:
+        # Never fail an edit because the identity restore failed.
+        pass
 
 
 # ── Password-protected PDF guard ──────────────────────────────────────────────
@@ -3170,6 +3295,7 @@ def _handle_multiline_replacement(page, target_text: str, replacement_text: str,
         alignment = _detect_justification(page, rect)
         debug_log.append(f"[MultiLine] Auto-detected alignment: {alignment}")
 
+    r_name = _unique_r_name(page)
     # Register font if needed (defense-in-depth: also pre-registered before branching)
     if use_internal_fontname and repl_font and hasattr(repl_font, 'buffer'):
         try:
@@ -3178,11 +3304,11 @@ def _handle_multiline_replacement(page, target_text: str, replacement_text: str,
             debug_log.append(f"[MultiLine] Font registration failed: {e}")
     elif not use_internal_fontname and repl_font and hasattr(repl_font, 'buffer'):
         try:
-            page.insert_font(fontname="R0", fontbuffer=repl_font.buffer)
+            page.insert_font(fontname=r_name, fontbuffer=repl_font.buffer)
         except Exception as e:
             debug_log.append(f"[MultiLine] Font registration failed: {e}")
 
-    fontname = use_internal_fontname if use_internal_fontname else "R0"
+    fontname = use_internal_fontname if use_internal_fontname else r_name
     # Use manual color override if set, otherwise preserve original text color.
     # Note: for redline documents, user should set force_black_text override.
     if manual_overrides and manual_overrides.get('force_black_text'):
@@ -3632,6 +3758,14 @@ def _apply_replace_to_open_doc(doc, target_text: str, replacement_text: str,
                     font_info['fontname'], flags=font_info.get('flags')
                 )
 
+                if is_standard and builtin_name and _font_embedded_on_page(page, font_info['fontname']):
+                    # Fork: a metric-compatible clone (ArialMT, TimesNewRomanPSMT,
+                    # CourierNew...) that is embedded in the file must keep its own
+                    # glyphs; swapping to Helvetica/Times/Courier changes the look.
+                    # Fall through to embedded-buffer reuse / the real system font.
+                    is_standard = False
+                    debug_log.append(f"Embedded font '{font_info['fontname']}' kept (no built-in swap)")
+
                 if is_standard and builtin_name:
                     # Use PyMuPDF built-in font for pixel-perfect match
                     use_internal_fontname = builtin_name
@@ -3748,6 +3882,7 @@ def _apply_replace_to_open_doc(doc, target_text: str, replacement_text: str,
 
             tracking_delta = float(manual_overrides.get('manual_tracking_delta', 0)) if manual_overrides else 0
 
+            r_name = _unique_r_name(page)
             # Register font on page for ALL insertion paths (multiline, reflow, legacy)
             # Previously, font was only registered in the legacy path, causing
             # reflow/multiline to use an unregistered fontname and silently fall back
@@ -3760,7 +3895,7 @@ def _apply_replace_to_open_doc(doc, target_text: str, replacement_text: str,
                     debug_log.append(f"Font pre-registration failed: {e}")
             elif not use_internal_fontname and repl_font and hasattr(repl_font, 'buffer'):
                 try:
-                    page.insert_font(fontname="R0", fontbuffer=repl_font.buffer)
+                    page.insert_font(fontname=r_name, fontbuffer=repl_font.buffer)
                     debug_log.append(f"Pre-registered replacement font as R0")
                 except Exception as e:
                     debug_log.append(f"Font pre-registration failed: {e}")
@@ -3800,7 +3935,7 @@ def _apply_replace_to_open_doc(doc, target_text: str, replacement_text: str,
                 reflow_attempted = False  # tracks whether reflow ran (and may have modified the page)
 
                 if not is_multiline and not multiline_success:
-                    r_fontname = use_internal_fontname if use_internal_fontname else "R0"
+                    r_fontname = use_internal_fontname if use_internal_fontname else r_name
                     # Use original text color for visual consistency
                     r_color = font_info.get('color', (0, 0, 0))
 
@@ -3991,7 +4126,7 @@ def _apply_replace_to_open_doc(doc, target_text: str, replacement_text: str,
 
                     # DIAGNOSTIC: Log insertion parameters
                     import sys
-                    print(f"[DIAGNOSTIC] Legacy insert_text: color={color}, fontsize={adjusted_fontsize:.1f}, fontname={use_internal_fontname or 'R0'}", file=sys.stderr)
+                    print(f"[DIAGNOSTIC] Legacy insert_text: color={color}, fontsize={adjusted_fontsize:.1f}, fontname={use_internal_fontname or r_name}", file=sys.stderr)
 
                     if use_internal_fontname:
                         try:
@@ -4026,24 +4161,24 @@ def _apply_replace_to_open_doc(doc, target_text: str, replacement_text: str,
                         # Try custom font buffer first
                         if repl_font and hasattr(repl_font, 'buffer'):
                             try:
-                                page.insert_font(fontname="R0", fontbuffer=repl_font.buffer)
+                                page.insert_font(fontname=r_name, fontbuffer=repl_font.buffer)
                                 if legacy_alignment == "justified":
                                     _insert_justified_text(
                                         page, (ins_x, ins_y), replacement_text,
-                                        fontname="R0", fontsize=adjusted_fontsize,
+                                        fontname=r_name, fontsize=adjusted_fontsize,
                                         color=color, available_width=rect.width,
                                         debug_log=debug_log
                                     )
                                 elif tracking_delta:
                                     _insert_tracked_text(
                                         page, (ins_x, ins_y), replacement_text,
-                                        fontname="R0", fontsize=adjusted_fontsize,
+                                        fontname=r_name, fontsize=adjusted_fontsize,
                                         color=color, tracking_delta=tracking_delta,
                                         debug_log=debug_log
                                     )
                                 else:
                                     reflow._insert_text_unicode_safe(page, (ins_x, ins_y), replacement_text,
-                                                                     "R0", adjusted_fontsize, color,
+                                                                     r_name, adjusted_fontsize, color,
                                                                      fontbuffer=getattr(repl_font, 'buffer', None),
                                                                      debug_log=debug_log)
                             except Exception:
@@ -4320,10 +4455,10 @@ def replace_text_in_pdf(input_path: str, output_path: str, target_text: str, rep
             if result.get('success') and result.get('modified'):
                 if finalize:
                     # Final user-initiated save: full PDF optimization
-                    doc.save(output_path, garbage=4, deflate=True, clean=True)
+                    _save_keep_identity(doc, output_path, input_path, garbage=4, deflate=True, clean=True)
                 else:
                     # Preview / intermediate edit: lightweight incremental save
-                    doc.save(output_path, garbage=0, deflate=False)
+                    _save_keep_identity(doc, output_path, input_path, garbage=0, deflate=False)
                 # Invalidate any cached before-state pixmaps for output_path: the
                 # file content has just changed so stale entries must not be reused.
                 _invalidate_file_pixmaps(output_path)
@@ -4901,7 +5036,7 @@ def replace_block_with_spans(
         debug_log.append("TextWriter completed")
         
         # Step 4: Save document
-        doc.save(output_path, garbage=4, deflate=True)
+        _save_keep_identity(doc, output_path, input_path, garbage=4, deflate=True)
 
         debug_log.append("Saved block replacement output")
 

@@ -507,7 +507,7 @@ def restore_from_memento(document_path: str, memento: dict, validate: bool = Tru
                     doc.update_stream(new_contents[0], content_stream)
 
             # Save restored PDF
-            doc.save(output_path, garbage=4, clean=True, deflate=True)
+            core._save_keep_identity(doc, output_path, document_path, garbage=4, clean=True, deflate=True)
 
         return {
             'success': True,

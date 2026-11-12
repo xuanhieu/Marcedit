@@ -1,5 +1,6 @@
 import fitz
 import os
+import re
 from . import harvester
 from . import synthesizer
 
@@ -519,12 +520,29 @@ def reflow_line(page, target_rect, replacement_text, font_info, debug_log=None, 
         debug_log.append(f"Reflow: Font text_length success: {est_new_width:.2f} using {clean_fontname}")
     except Exception as e:
         debug_log.append(f"Reflow: Font text_length failed ({e}), using fallback: {est_new_width:.2f}")
-        # Improve fallback calculation based on character types
-        # Wide characters (M, W, m, w) vs narrow (i, j, l, t, f)
-        wide_chars = sum(1 for c in replacement_text if c in 'MWmwWM')
-        narrow_chars = sum(1 for c in replacement_text if c in 'ijltfIJLT')
-        avg_width_factor = 0.5 + (wide_chars - narrow_chars) * 0.1 / max(len(replacement_text), 1)
-        est_new_width = len(replacement_text) * fontsize * avg_width_factor
+        # Fork fix: in synthesis mode the new text is stamped from harvested glyphs,
+        # so measure with those same advances.  The rough guess below mis-sized
+        # centered/right-aligned text by several points (a visible sideways shift).
+        _measured = None
+        try:
+            if font_info.get("use_synthesis_mode"):
+                _gm, _miss = harvester.harvest_glyphs(
+                    page.parent, set(replacement_text),
+                    font_info.get("original_fontname") or clean_fontname,
+                    target_color=None, page_limit=50)
+                _miss.discard(" ")
+                if _gm and not _miss:
+                    _measured = synthesizer.measure_text(replacement_text, _gm, fontsize)
+        except Exception:
+            _measured = None
+        if _measured:
+            est_new_width = _measured
+            debug_log.append(f"Reflow: measured from harvested glyph advances: {est_new_width:.2f}")
+        else:
+            wide_chars = sum(1 for c in replacement_text if c in 'MWmwWM')
+            narrow_chars = sum(1 for c in replacement_text if c in 'ijltfIJLT')
+            avg_width_factor = 0.5 + (wide_chars - narrow_chars) * 0.1 / max(len(replacement_text), 1)
+            est_new_width = len(replacement_text) * fontsize * avg_width_factor
 
     delta = est_new_width - old_width
     debug_log.append(f"Reflow: Old W: {old_width:.2f}, New W: {est_new_width:.2f}, Delta: {delta:.2f}")

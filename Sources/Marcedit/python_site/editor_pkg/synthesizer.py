@@ -147,3 +147,41 @@ def draw_text_as_vectors(page, start_point, text, glyph_map, size, color=None, d
         total_width += advance
         
     return total_width, drawn_rects
+
+
+def measure_text(text, glyph_map, size, space_width=None, tracking_delta=None):
+    """Width draw_text_as_vectors would advance for *text*, without drawing.
+
+    Fork addition: lets reflow place centered / right-aligned text exactly. The
+    advance rules below mirror draw_text_as_vectors."""
+    total = 0.0
+    for char in text:
+        if char == ' ':
+            if space_width is not None:
+                total += space_width
+            elif ' ' in glyph_map and glyph_map[' '].get('size', 0) > 0:
+                total += glyph_map[' ']['advance'] * (size / glyph_map[' ']['size'])
+            else:
+                total += size * 0.30
+            continue
+        g = glyph_map.get(char)
+        if not g or not g.get('bbox') or not g.get('origin'):
+            continue
+        src_size = g.get('size', 0)
+        scale = max(0.01, min(size / src_size if src_size > 0 else 1.0, 100.0))
+        if g.get('advance', 0) > 0:
+            adv = g['advance'] * scale
+        else:
+            w = g['bbox'].width * scale
+            if char in 'ijltfIJLTF':
+                adv = max(w * 1.25, size * 0.28)
+            elif char in 'mwMW':
+                adv = w * 1.08
+            elif char in '.,:;!?':
+                adv = max(w * 1.20, size * 0.20)
+            else:
+                adv = w * 1.15
+        if tracking_delta:
+            adv += tracking_delta
+        total += adv
+    return total
